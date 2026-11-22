@@ -95,6 +95,35 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Configure Google Maven Central Mirror (bypass GitHub Actions rate limits)
+        shell: bash
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
+          def mirrorUrl = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+          def redirectToMirror = { RepositoryHandler repos ->
+              repos.all { ArtifactRepository repo ->
+                  if (repo instanceof MavenArtifactRepository) {
+                      def u = repo.url?.toString() ?: ''
+                      if (u.startsWith('https://repo.maven.apache.org/maven2') || u.startsWith('https://repo1.maven.org/maven2')) {
+                          repo.setUrl(mirrorUrl)
+                      }
+                  }
+              }
+          }
+
+          gradle.beforeSettings { settings ->
+              redirectToMirror(settings.pluginManagement.repositories)
+              redirectToMirror(settings.dependencyResolutionManagement.repositories)
+          }
+
+          gradle.allprojects { project ->
+              redirectToMirror(project.buildscript.repositories)
+              redirectToMirror(project.repositories)
+          }
+          EOF
+
       - name: Prepare signing keystore
         id: signing
         shell: bash
