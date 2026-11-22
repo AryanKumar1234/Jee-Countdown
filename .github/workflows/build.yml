@@ -1,0 +1,181 @@
+name: Build & Release CloneSpace APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag (e.g., v1.0.0). Leave empty for auto tag."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_ZIP: "CloneSpace-source.zip"
+  APP_NAME: "CloneSpace"
+
+jobs:
+  build-and-release:
+    name: Extract Source, Build APK & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Auto-detect, extract source zip & list files
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build_src
+
+          ZIP_FILE=""
+          if [ -f "${SOURCE_ZIP}" ]; then
+            ZIP_FILE="${SOURCE_ZIP}"
+          else
+            echo "Searching repository (including all subfolders) for ${SOURCE_ZIP}..."
+            ZIP_FILE=$(find . -path './.git' -prune -o -type f -name "${SOURCE_ZIP}" -print | sort | head -n 1 || true)
+          fi
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Searching repository (including all subfolders) for any .zip archive..."
+            ZIP_FILE=$(find . -path './.git' -prune -o -type f -name "*.zip" -print | sort | head -n 1 || true)
+          fi
+
+          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::No source .zip file found anywhere in the repository."
+            exit 1
+          fi
+
+          echo "Detected source archive: $ZIP_FILE"
+          mkdir -p build_src
+          unzip -qo "$ZIP_FILE" -d build_src
+
+          echo "=== Extracted Files ==="
+          find build_src -type f | sort
+          echo "======================="
+
+          # Recursively locate the Gradle project root at any subfolder depth inside the zip
+          SETTINGS_FILE=$(find build_src -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | sort | head -n 1 || true)
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Could not find settings.gradle.kts or settings.gradle inside $ZIP_FILE"
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected Android project root: $PROJECT_DIR"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Prepare signing keystore
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYSTORE_FILE="${GITHUB_WORKSPACE}/release-signing.jks"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "Using repository signing secrets..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+            echo "ks_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "ks_pass=$KEYSTORE_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "key_alias=$KEY_ALIAS" >> "$GITHUB_OUTPUT"
+            echo "key_pass=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets configured; generating a self-signed release keystore so the APK is directly installable..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_FILE" \
+              -storetype PKCS12 \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -alias clonespace \
+              -storepass clonespace123 \
+              -keypass clonespace123 \
+              -dname "CN=CloneSpace, OU=Mobile, O=CloneSpace, L=Bengaluru, S=KA, C=IN"
+            echo "ks_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "ks_pass=clonespace123" >> "$GITHUB_OUTPUT"
+            echo "key_alias=clonespace" >> "$GITHUB_OUTPUT"
+            echo "key_pass=clonespace123" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Release APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        env:
+          SIGNING_STORE_FILE: ${{ steps.signing.outputs.ks_path }}
+          SIGNING_STORE_PASSWORD: ${{ steps.signing.outputs.ks_pass }}
+          SIGNING_KEY_ALIAS: ${{ steps.signing.outputs.key_alias }}
+          SIGNING_KEY_PASSWORD: ${{ steps.signing.outputs.key_pass }}
+        run: |
+          gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Prepare Release APK & Version Tag
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.extract.outputs.project_dir }}"
+          APK_SOURCE=$(find "$PROJECT_DIR/app/build/outputs/apk/release" -type f -name "*.apk" | head -n 1 || true)
+
+          if [ -z "$APK_SOURCE" ] || [ ! -f "$APK_SOURCE" ]; then
+            echo "::error::Release APK not found after Gradle build."
+            exit 1
+          fi
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            RELEASE_TAG="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            RELEASE_TAG="${{ inputs.release_tag }}"
+          else
+            RELEASE_TAG="v1.0.${{ github.run_number }}"
+          fi
+
+          mkdir -p release_out
+          FINAL_APK="release_out/${APP_NAME}-${RELEASE_TAG}.apk"
+          cp "$APK_SOURCE" "$FINAL_APK"
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$FINAL_APK" >> "$GITHUB_OUTPUT"
+          echo "Packaged release APK: $FINAL_APK"
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.package.outputs.tag }}
+          path: ${{ steps.package.outputs.apk_path }}
+
+      - name: Create GitHub Release with APK
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: "${{ env.APP_NAME }} ${{ steps.package.outputs.tag }}"
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.apk_path }}
