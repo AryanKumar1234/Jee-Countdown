@@ -1,218 +1,86 @@
-name: Build & Release CloneSpace APK
+name: Build and Release APK
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - "v*"
+    branches: [main, master]
+    paths-ignore:
+      - 'exam.json'
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Optional release tag (e.g., v1.0.0). Leave empty for auto tag."
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
-env:
-  SOURCE_ZIP: "CloneSpace-source.zip"
-  APP_NAME: "CloneSpace"
-
 jobs:
-  build-and-release:
-    name: Extract Source, Build APK & Publish Release
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Auto-detect, extract source zip & list files
-        id: extract
-        shell: bash
+      # Finds the project automatically:
+      #  - if the files are already in the repo, uses them
+      #  - otherwise unzips the .zip found in the repo (source.zip etc.)
+      #  - works even if the zip has an extra folder inside
+      - name: Locate or extract project
         run: |
-          set -euo pipefail
-          rm -rf build_src
-
-          ZIP_FILE=""
-          if [ -f "${SOURCE_ZIP}" ]; then
-            ZIP_FILE="${SOURCE_ZIP}"
+          set -e
+          if [ -f settings.gradle ]; then
+            ROOT="$GITHUB_WORKSPACE"
           else
-            echo "Searching repository (including all subfolders) for ${SOURCE_ZIP}..."
-            ZIP_FILE=$(find . -path './.git' -prune -o -type f -name "${SOURCE_ZIP}" -print | sort | head -n 1 || true)
+            ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -z "$ZIP" ]; then
+              echo "::error::No settings.gradle and no .zip file found in the repo. Upload source.zip to the repo root."
+              exit 1
+            fi
+            echo "Extracting $ZIP"
+            mkdir -p "$RUNNER_TEMP/src"
+            unzip -q -o "$ZIP" -d "$RUNNER_TEMP/src"
+            SG=$(find "$RUNNER_TEMP/src" -name settings.gradle | head -n 1)
+            if [ -z "$SG" ]; then
+              echo "::error::settings.gradle not found inside $ZIP"
+              exit 1
+            fi
+            ROOT=$(dirname "$SG")
+          fi
+          echo "Project root: $ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+
+      # The app downloads the exam date from exam.json in the repo root.
+      # If it is missing there, copy it from the project and commit it.
+      - name: Make sure exam.json is in the repo root
+        run: |
+          if [ ! -f exam.json ] && [ -f "$PROJECT_DIR/exam.json" ]; then
+            cp "$PROJECT_DIR/exam.json" exam.json
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add exam.json
+            git commit -m "Add exam.json"
+            git push
           fi
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Searching repository (including all subfolders) for any .zip archive..."
-            ZIP_FILE=$(find . -path './.git' -prune -o -type f -name "*.zip" -print | sort | head -n 1 || true)
-          fi
-
-          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
-            echo "::error::No source .zip file found anywhere in the repository."
-            exit 1
-          fi
-
-          echo "Detected source archive: $ZIP_FILE"
-          mkdir -p build_src
-          unzip -qo "$ZIP_FILE" -d build_src
-
-          echo "=== Extracted Files ==="
-          find build_src -type f | sort
-          echo "======================="
-
-          # Recursively locate the Gradle project root at any subfolder depth inside the zip
-          SETTINGS_FILE=$(find build_src -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | sort | head -n 1 || true)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Could not find settings.gradle.kts or settings.gradle inside $ZIP_FILE"
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected Android project root: $PROJECT_DIR"
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: '17'
 
-      - name: Configure Android SDK (API 35)
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -type f -name "sdkmanager" | sort -V | tail -n 1)
-          echo "Using sdkmanager: $SDKMANAGER"
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          gradle-version: '8.7'
 
-      - name: Configure Google Maven Central Mirror (bypass GitHub Actions rate limits)
-        shell: bash
+      - name: Point the app at this repo's exam.json
         run: |
-          mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
-          def mirrorUrl = 'https://maven-central.storage-download.googleapis.com/maven2/'
+          sed -i "s#OWNER/REPO/BRANCH#${{ github.repository }}/${{ github.ref_name }}#" "$PROJECT_DIR/app/src/main/res/values/config.xml"
 
-          def redirectToMirror = { RepositoryHandler repos ->
-              repos.all { ArtifactRepository repo ->
-                  if (repo instanceof MavenArtifactRepository) {
-                      def u = repo.url?.toString() ?: ''
-                      if (u.startsWith('https://repo.maven.apache.org/maven2') || u.startsWith('https://repo1.maven.org/maven2')) {
-                          repo.setUrl(mirrorUrl)
-                      }
-                  }
-              }
-          }
-
-          gradle.beforeSettings { settings ->
-              redirectToMirror(settings.pluginManagement.repositories)
-              redirectToMirror(settings.dependencyResolutionManagement.repositories)
-          }
-
-          gradle.allprojects { project ->
-              redirectToMirror(project.buildscript.repositories)
-              redirectToMirror(project.repositories)
-          }
-          EOF
-
-      - name: Prepare signing keystore
-        id: signing
-        shell: bash
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Build debug APK
         run: |
-          set -euo pipefail
-          KEYSTORE_FILE="${GITHUB_WORKSPACE}/release-signing.jks"
+          cd "$PROJECT_DIR"
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/JEE-Countdown.apk"
 
-          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
-            echo "Using repository signing secrets..."
-            echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
-            echo "ks_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
-            echo "ks_pass=$KEYSTORE_PASSWORD" >> "$GITHUB_OUTPUT"
-            echo "key_alias=$KEY_ALIAS" >> "$GITHUB_OUTPUT"
-            echo "key_pass=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"
-          else
-            echo "No signing secrets configured; generating a self-signed release keystore so the APK is directly installable..."
-            keytool -genkeypair -v \
-              -keystore "$KEYSTORE_FILE" \
-              -storetype PKCS12 \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -alias clonespace \
-              -storepass clonespace123 \
-              -keypass clonespace123 \
-              -dname "CN=CloneSpace, OU=Mobile, O=CloneSpace, L=Bengaluru, S=KA, C=IN"
-            echo "ks_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
-            echo "ks_pass=clonespace123" >> "$GITHUB_OUTPUT"
-            echo "key_alias=clonespace" >> "$GITHUB_OUTPUT"
-            echo "key_pass=clonespace123" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build Release APK
-        working-directory: ${{ steps.extract.outputs.project_dir }}
-        env:
-          SIGNING_STORE_FILE: ${{ steps.signing.outputs.ks_path }}
-          SIGNING_STORE_PASSWORD: ${{ steps.signing.outputs.ks_pass }}
-          SIGNING_KEY_ALIAS: ${{ steps.signing.outputs.key_alias }}
-          SIGNING_KEY_PASSWORD: ${{ steps.signing.outputs.key_pass }}
-        run: |
-          gradle assembleRelease --no-daemon --stacktrace
-
-      - name: Prepare Release APK & Version Tag
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROJECT_DIR="${{ steps.extract.outputs.project_dir }}"
-          APK_SOURCE=$(find "$PROJECT_DIR/app/build/outputs/apk/release" -type f -name "*.apk" | head -n 1 || true)
-
-          if [ -z "$APK_SOURCE" ] || [ ! -f "$APK_SOURCE" ]; then
-            echo "::error::Release APK not found after Gradle build."
-            exit 1
-          fi
-
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            RELEASE_TAG="${{ github.ref_name }}"
-          elif [ -n "${{ inputs.release_tag }}" ]; then
-            RELEASE_TAG="${{ inputs.release_tag }}"
-          else
-            RELEASE_TAG="v1.0.${{ github.run_number }}"
-          fi
-
-          mkdir -p release_out
-          FINAL_APK="release_out/${APP_NAME}-${RELEASE_TAG}.apk"
-          cp "$APK_SOURCE" "$FINAL_APK"
-
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "apk_path=$FINAL_APK" >> "$GITHUB_OUTPUT"
-          echo "Packaged release APK: $FINAL_APK"
-
-      - name: Upload APK as Workflow Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ env.APP_NAME }}-${{ steps.package.outputs.tag }}
-          path: ${{ steps.package.outputs.apk_path }}
-
-      - name: Create GitHub Release with APK
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.package.outputs.tag }}
-          name: "${{ env.APP_NAME }} ${{ steps.package.outputs.tag }}"
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            ${{ steps.package.outputs.apk_path }}
-            
+          tag_name: v1.0.${{ github.run_number }}
+          name: JEE Countdown v1.0.${{ github.run_number }}
+          body: |
+            Install JEE-Countdown.apk, then add the "JEE Countdown" and "JEE Updates" widgets from your home screen widget list.
+          files: JEE-Countdown.apk
