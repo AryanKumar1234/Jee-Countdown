@@ -10,15 +10,27 @@ on:
 permissions:
   contents: write
 
+# Two builds never run at the same time, so version numbers can't clash.
+concurrency:
+  group: release-build
+  cancel-in-progress: false
+
+env:
+  # Change this to 3 to start a new 3.0, 3.1, 3.2 ... series.
+  MAJOR: "2"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0 = full history + tags (needed to find the newest zip and the last version)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Finds the project automatically:
       #  - if the files are already in the repo, uses them
-      #  - otherwise unzips the .zip found in the repo (source.zip etc.)
+      #  - otherwise unzips the NEWEST .zip in the repo (by last commit time)
       #  - works even if the zip has an extra folder inside
       - name: Locate or extract project
         run: |
@@ -26,7 +38,9 @@ jobs:
           if [ -f settings.gradle ]; then
             ROOT="$GITHUB_WORKSPACE"
           else
-            ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | head -n 1)
+            ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -print0 \
+              | while IFS= read -r -d '' z; do printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$z")" "$z"; done \
+              | sort -rn | head -n 1 | cut -f2-)
             if [ -z "$ZIP" ]; then
               echo "::error::No settings.gradle and no .zip file found in the repo. Upload source.zip to the repo root."
               exit 1
@@ -43,6 +57,19 @@ jobs:
           fi
           echo "Project root: $ROOT"
           echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+
+      # Next version = last released v<MAJOR>.N tag + 1  ->  2.0, 2.1, 2.2 ...
+      - name: Work out the next version
+        run: |
+          set -e
+          LAST=$(git ls-remote --tags --refs origin "v${MAJOR}.*" \
+            | sed -E "s#.*refs/tags/v${MAJOR}\.##" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          if [ -z "$LAST" ]; then MINOR=0; else MINOR=$((LAST + 1)); fi
+          VERSION="${MAJOR}.${MINOR}"
+          CODE=$((MAJOR * 1000 + MINOR))
+          echo "Building version $VERSION (versionCode $CODE)"
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP_CODE=$CODE" >> "$GITHUB_ENV"
 
       # The app downloads the exam date from exam.json in the repo root.
       # If it is missing there, copy it from the project and commit it.
@@ -70,6 +97,11 @@ jobs:
         run: |
           sed -i "s#OWNER/REPO/BRANCH#${{ github.repository }}/${{ github.ref_name }}#" "$PROJECT_DIR/app/src/main/res/values/config.xml"
 
+      - name: Stamp the version into the app
+        run: |
+          sed -i -E "s/versionCode [0-9]+/versionCode $APP_CODE/; s/versionName \"[^\"]*\"/versionName \"$APP_VERSION\"/" "$PROJECT_DIR/app/build.gradle"
+          grep -nE "versionCode|versionName" "$PROJECT_DIR/app/build.gradle"
+
       - name: Build debug APK
         run: |
           cd "$PROJECT_DIR"
@@ -79,8 +111,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: JEE Countdown v1.0.${{ github.run_number }}
+          tag_name: v${{ env.APP_VERSION }}
+          name: JEE Countdown v${{ env.APP_VERSION }}
           body: |
-            Install JEE-Countdown.apk, then add the "JEE Countdown" and "JEE Updates" widgets from your home screen widget list.
+            JEE Countdown ${{ env.APP_VERSION }}. Install JEE-Countdown.apk, then add the widgets from your home screen widget list:
+            JEE Mains Style 1, JEE Mains Style 2, JEE Advanced Style 1, JEE Advanced Style 2 and JEE Updates.
           files: JEE-Countdown.apk
+          
